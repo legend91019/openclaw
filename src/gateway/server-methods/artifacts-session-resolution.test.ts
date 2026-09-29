@@ -21,7 +21,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../server-session-key.js", () => ({
-  resolveSessionKeyForRun: mocks.resolveRunSession,
+  resolveSessionForRun: mocks.resolveRunSession,
 }));
 
 async function resolveSession(
@@ -93,7 +93,7 @@ describe("artifact session authorization", () => {
           visibility: "shared",
         },
       );
-      mocks.resolveRunSession.mockReturnValue(sessionKey);
+      mocks.resolveRunSession.mockReturnValue({ sessionKey, agentId: "main" });
       const viewer = identifiedClient(["operator.read"]);
 
       await expect(
@@ -157,7 +157,7 @@ describe("artifact session authorization", () => {
             visibility,
           },
         );
-        mocks.resolveRunSession.mockReturnValue(sessionKey);
+        mocks.resolveRunSession.mockReturnValue({ sessionKey, agentId: "main" });
         const viewer = role
           ? roleClient(role, "artifact-viewer")
           : identifiedClient(["operator.read"], viewerProfile.id);

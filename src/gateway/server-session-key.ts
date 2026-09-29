@@ -3,12 +3,9 @@ import { getRuntimeConfig } from "../config/io.js";
 import type { SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.js";
 import { getAgentRunContext } from "../infra/agent-run-registry.js";
-import {
-  normalizeAgentId,
-  parseAgentSessionKey,
-  toAgentRequestSessionKey,
-} from "../routing/session-key.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import { resolvePreferredSessionKeyForSessionIdMatches } from "../sessions/session-id-resolution.js";
+import { resolveChatRunOwnerAgentId } from "./chat-run-owner.js";
 import type { SessionRowProjection } from "./session-row-projection.js";
 import { resolveSessionStoreIdentity } from "./session-store-key.js";
 
@@ -33,12 +30,8 @@ function sessionKeyMatchesAgent(sessionKey: string, agentId: string, cfg: OpenCl
   }
 }
 
-function resolveRunSessionKeyForCaller(storeKey: string) {
-  return toAgentRequestSessionKey(storeKey) ?? storeKey;
-}
-
-/** Resolves live runs or the resident current-session ID index without storage reads. */
-export function resolveSessionKeyForRun(
+/** Resolves the selected run owner and unchanged key without storage reads. */
+export function resolveSessionForRun(
   runId: string,
   opts: { agentId?: string; projection?: Pick<SessionRowProjection, "findBySessionId"> } = {},
 ) {
@@ -49,13 +42,18 @@ export function resolveSessionKeyForRun(
   }
   const explicitAgentId = opts.agentId?.trim() ? normalizeAgentId(opts.agentId) : undefined;
   const cached = context?.sessionKey;
+  const cachedAgentId = resolveChatRunOwnerAgentId(context ?? {});
   if (!explicitAgentId && cached) {
-    return cached;
+    return { sessionKey: cached, agentId: cachedAgentId };
   }
   const cfg = getRuntimeConfig();
   const requestedAgentId = explicitAgentId ?? normalizeAgentId(resolveDefaultAgentId(cfg));
-  if (cached && sessionKeyMatchesAgent(cached, requestedAgentId, cfg)) {
-    return resolveRunSessionKeyForCaller(cached);
+  if (
+    cached &&
+    (!context?.agentId?.trim() || cachedAgentId === requestedAgentId) &&
+    sessionKeyMatchesAgent(cached, requestedAgentId, cfg)
+  ) {
+    return { sessionKey: cached, agentId: cachedAgentId ?? requestedAgentId };
   }
   // The projection owns both hits and absence. Committed identity publications
   // update its index, so orphan events need neither scans nor a timed miss cache.
@@ -71,5 +69,5 @@ export function resolveSessionKeyForRun(
     }
   }
   const storeKey = resolvePreferredSessionKeyForSessionIdMatches(matches, runId);
-  return storeKey ? resolveRunSessionKeyForCaller(storeKey) : undefined;
+  return storeKey ? { sessionKey: storeKey, agentId: requestedAgentId } : undefined;
 }

@@ -12,7 +12,7 @@ import {
   resolveAgentIdFromSessionKey,
   toAgentStoreSessionKey,
 } from "../../routing/session-key.js";
-import { resolveSessionKeyForRun } from "../server-session-key.js";
+import { resolveSessionForRun } from "../server-session-key.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import type { SessionRowProjection } from "../session-row-projection.js";
 import {
@@ -109,12 +109,14 @@ function resolveQuerySession(
   if (query.runId) {
     // A live run context can resolve its own agent-scoped key. Do not force an
     // unrelated default-agent selection before consulting that authoritative row.
-    const sessionKey = resolveSessionKeyForRun(query.runId, {
+    const selected = resolveSessionForRun(query.runId, {
       ...(query.agentId ? { agentId: query.agentId } : {}),
       ...(projection ? { projection } : {}),
     });
+    const sessionKey = selected?.sessionKey;
     const agentId =
       query.agentId ??
+      selected?.agentId ??
       resolveArtifactSessionAgentId(sessionKey, cfg) ??
       resolveSessionAgentId({ config: cfg });
     const scopedSessionKey = resolveScopedArtifactSessionKey(sessionKey, agentId, cfg);

@@ -304,7 +304,7 @@ export function startGatewayEventSubscriptions(params: {
     () => {
       // Lazy-load heavy chat modules only after the first agent event reaches the gateway.
       return Promise.all([import("./server-chat.js"), getSessionKeyModule()]).then(
-        ([{ createAgentEventHandler }, { resolveSessionKeyForRun }]) =>
+        ([{ createAgentEventHandler }, { resolveSessionForRun }]) =>
           createAgentEventHandler({
             broadcast: params.broadcast,
             broadcastToConnIds: params.broadcastToConnIds,
@@ -313,10 +313,10 @@ export function startGatewayEventSubscriptions(params: {
             agentRunSeq: params.agentRunSeq,
             chatRunState: params.chatRunState,
             resolveSessionKeyForRun: (runId, options) =>
-              resolveSessionKeyForRun(runId, {
+              resolveSessionForRun(runId, {
                 ...options,
                 projection: params.getSessionRowProjection?.(),
-              }),
+              })?.sessionKey,
             clearAgentRunContext,
             toolEventRecipients: params.toolEventRecipients,
             sessionEventSubscribers: params.sessionEventSubscribers,
@@ -500,10 +500,10 @@ export function startGatewayEventSubscriptions(params: {
         trackedOwnerIsCurrent &&
         claimIsComplete;
       const writeContext = captureAgentRunTerminalWriteContext(evt.runId);
-      const prepareTerminalPersistence = (sessionKey: string) => {
+      const prepareTerminalPersistence = (sessionKey: string, agentId = sessionAgentId) => {
         const persistence = sessionLifecyclePersistence.observe({
           sessionKey,
-          ...(sessionAgentId ? { agentId: sessionAgentId } : {}),
+          ...(agentId ? { agentId } : {}),
           event: evt,
           ...(terminalAuthority ? { authority: terminalAuthority } : {}),
           ...(writeContext ? { writeContext } : {}),
@@ -543,13 +543,13 @@ export function startGatewayEventSubscriptions(params: {
         } else {
           // Context cleanup can precede a terminal event. Resolve its persisted
           // run mapping before the lazy chat handler consumes the same event.
-          terminalPreparation = getSessionKeyModule().then(async ({ resolveSessionKeyForRun }) => {
-            const sessionKey = resolveSessionKeyForRun(evt.runId, {
+          terminalPreparation = getSessionKeyModule().then(async ({ resolveSessionForRun }) => {
+            const selected = resolveSessionForRun(evt.runId, {
               agentId: sessionAgentId,
               projection: params.getSessionRowProjection?.(),
             });
-            if (sessionKey) {
-              await prepareTerminalPersistence(sessionKey);
+            if (selected) {
+              await prepareTerminalPersistence(selected.sessionKey, selected.agentId);
             }
           });
           writeContext?.track(terminalPreparation);
