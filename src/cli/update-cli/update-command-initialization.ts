@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { LegacyConfigUpdatePlan } from "../../commands/doctor/legacy-config-repair.js";
 import { acquireGatewayStateOwner } from "../../infra/gateway-state-owner.js";
 import { hasNodeErrorCode } from "../../infra/path-guards.js";
 import { SQLITE_SIDECAR_SUFFIXES } from "../../infra/sqlite-files.js";
@@ -32,10 +33,14 @@ export type UpdateTargetSelection =
 export type InitializedUpdate = UpdateInitializationAdmission &
   UpdateTargetSelection & {
     executor: UpdateCommandExecutor;
-    registerRun: (run: NonNullable<UpdateCommandOptions["run"]>) => Promise<void>;
+    registerRun: (
+      run: NonNullable<UpdateCommandOptions["run"]>,
+      disposePresentation: () => void,
+    ) => Promise<void>;
     stagedPackage?: StagedPackageInstallUpdate;
     candidateAdmission?: UpdateCandidateAdmissionResult;
     downgradeConfirmed?: boolean;
+    callerLegacyConfigPlan?: LegacyConfigUpdatePlan;
   };
 
 export async function confirmFreshUpdateDowngrade(params: {

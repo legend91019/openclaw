@@ -1,11 +1,11 @@
 /* @vitest-environment jsdom */
 
-import { render } from "lit";
+import { createComponent } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderCommunityInviteCard } from "./community-invite-card.ts";
+import { cleanupSolid, mountSolid } from "../test-helpers/mount-solid.ts";
+import { flush } from "../test-helpers/solid-settle.ts";
 import { COMMUNITY_INVITE_KEY } from "./community-invite-state.ts";
-
-const COMMUNITY_INVITE_URL = "https://discord.gg/clawd";
+import { SidebarCommunityInvite } from "./solid/sidebar-community-invite.tsx";
 
 const onDismiss = vi.fn<() => void>();
 let container: HTMLDivElement;
@@ -15,10 +15,14 @@ beforeEach(() => {
   container = document.createElement("div");
   onDismiss.mockReset();
   document.body.append(container);
-  render(renderCommunityInviteCard(onDismiss), container);
+  mountSolid(() => createComponent(SidebarCommunityInvite, { onDismiss, mode: "dark" }), {
+    container,
+  });
+  flush();
 });
 
 afterEach(() => {
+  cleanupSolid();
   container.remove();
   localStorage.clear();
   vi.restoreAllMocks();
@@ -42,10 +46,6 @@ describe("community invite card", () => {
     expect(container.querySelector("[autofocus]")).toBeNull();
   });
 
-  it("leaves persistence to the sidebar owner", () => {
-    expect(localStorage.getItem(COMMUNITY_INVITE_KEY)).toBeNull();
-  });
-
   it("delegates dismissal from the close button", () => {
     const close = cardQuery(".invite__close");
     expect(close.getAttribute("aria-label")).toBe("Dismiss and don't show again");
@@ -54,12 +54,22 @@ describe("community invite card", () => {
     expect(localStorage.getItem(COMMUNITY_INVITE_KEY)).toBeNull();
   });
 
-  it("keeps the invite active when the Discord link is opened", () => {
-    const cta = cardQuery(".invite__cta");
-    expect(cta.getAttribute("href")).toBe(COMMUNITY_INVITE_URL);
-    expect(cta.getAttribute("target")).toBe("_blank");
-    expect(cta.getAttribute("rel")).toContain("noopener");
-    cta.click();
+  it("opens each community destination without dismissing the invitation", () => {
+    const links = [...container.querySelectorAll<HTMLAnchorElement>(".invite__cta")];
+    expect(
+      links.map((link) => [link.textContent?.trim(), link.getAttribute("aria-label"), link.href]),
+    ).toEqual([
+      ["Join", "Join the OpenClaw community on Reddit", "https://www.reddit.com/r/openclaw/"],
+      ["Join", "Join the OpenClaw community on Discord", "https://discord.gg/clawd"],
+      ["Follow", "Follow OpenClaw on X", "https://x.com/openclaw"],
+    ]);
+    for (const link of links) {
+      expect(link.target).toBe("_blank");
+      expect(link.title).toBe(link.getAttribute("aria-label"));
+      expect(link.rel.split(/\s+/u)).toEqual(expect.arrayContaining(["noopener", "noreferrer"]));
+      link.click();
+    }
+    expect(onDismiss).not.toHaveBeenCalled();
     expect(localStorage.getItem(COMMUNITY_INVITE_KEY)).toBeNull();
     expect(cardQuery(".community-invite-card").isConnected).toBe(true);
   });

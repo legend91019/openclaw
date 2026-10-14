@@ -1,104 +1,158 @@
+import path from "node:path";
+import { runInNewContext } from "node:vm";
 import { expect, it } from "vitest";
 import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
-import {
-  createSessionHistoryWorkerReaders,
-  type SessionHistoryWorkerRequestRunner,
-} from "./session-transcript-worker-readers.js";
+import { createSessionHistoryWorkerReaders } from "./session-transcript-worker-readers.js";
+import { createSessionHistoryWorkerRequestStub } from "./session-transcript-worker-readers.test-support.js";
 
-/**
- * `captureSessionTranscriptStorageEnvironment` is unit-tested against the
- * environment it produces. These tests cover the layer above it: what the
- * `readExactEntries` reader actually hands to the worker boundary. The worker
- * receives its request through `Worker.postMessage`, which structured-clones the
- * payload, so any value that cannot be cloned (notably the case-insensitive
- * `Proxy` returned by `cloneEnvWithPlatformSemantics` on win32) must be
- * materialized before it reaches `prepare()`.
- *
- * The reader's input and result types are derived from its own signature so these
- * tests keep tracking the shipped reader rather than a hand-copied shape.
- */
-
-type Readers = ReturnType<typeof createSessionHistoryWorkerReaders>;
-type ExactEntriesInput = Parameters<Readers["readExactEntries"]>[0];
-type ExactEntriesResult = Awaited<ReturnType<Readers["readExactEntries"]>>;
-/** The value `prepare()` returns, i.e. exactly what `worker.postMessage` receives. */
-type PreparedInput = ReturnType<Parameters<SessionHistoryWorkerRequestRunner>[0]>;
-
-/** Capture what the reader hands to `worker.postMessage`, then clone it the way the worker does. */
-function captureBoundary(): {
-  prepared: PreparedInput[];
-  runRequest: SessionHistoryWorkerRequestRunner;
-} {
-  const prepared: PreparedInput[] = [];
-  const runRequest: SessionHistoryWorkerRequestRunner = async (prepare, _bytes, receive) => {
-    const input = prepare();
-    prepared.push(input);
-    // `Worker.postMessage` structured-clones the prepared input; mirror that here.
-    structuredClone(input);
-    return receive({
-      kind: "session-exact-entries",
-      entries: [],
-      lifecycleTimestamps: {},
-    } as ExactEntriesResult);
-  };
-  return { prepared, runRequest };
-}
-
-const request = (env: NodeJS.ProcessEnv): ExactEntriesInput => ({
-  env: cloneEnvWithPlatformSemantics(env),
-  sessionKeys: ["agent:main:main"],
+it("preserves the direct read request, signal, and projected result", async () => {
+  const input = { scope: { agentId: "main", sessionId: "synthetic-session" } };
+  const signal = new AbortController().signal;
+  const readers = createSessionHistoryWorkerReaders(
+    createSessionHistoryWorkerRequestStub(async (prepare, inputBytes, receivedSignal) => {
+      expect(prepare()).toEqual({ kind: "transcript-message-presence", ...input });
+      expect(inputBytes).toBe(JSON.stringify(input).length * 2);
+      expect(receivedSignal).toBe(signal);
+      return { kind: "transcript-message-presence", present: true };
+    }),
+  );
+  await expect(readers.readMessagePresence(input, signal)).resolves.toBe(true);
 });
 
-it.each(["linux", "win32"] as const)(
-  "readExactEntries yields a structured-cloneable request on %s",
-  async (platform) => {
-    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { value: platform });
+it.each(["archives", "corpus", "targets", "exact entries"] as const)(
+  "serializes Windows storage environments for %s requests",
+  async (inventory) => {
+    const stateDir = path.resolve("synthetic-state");
+    const storePath = path.join(stateDir, "sessions.sqlite");
+    const platform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32" });
     try {
-      const { prepared, runRequest } = captureBoundary();
-      const readers = createSessionHistoryWorkerReaders(runRequest);
-
-      await expect(
-        readers.readExactEntries(
-          request({
-            OPENCLAW_STATE_DIR: "synthetic-state",
-            Path: "synthetic-bin",
-          }),
-        ),
-      ).resolves.toEqual({ kind: "session-exact-entries", entries: [], lifecycleTimestamps: {} });
-
-      // The boundary capture above already cloned the payload; assert it again so
-      // the intent is explicit at the assertion site.
-      expect(prepared).toHaveLength(1);
-      expect(() => structuredClone(prepared[0])).not.toThrow();
-      expect(prepared[0].kind).toBe("session-exact-entries");
+      const env = cloneEnvWithPlatformSemantics({
+        openclaw_state_dir: stateDir,
+        OpenClaw_Supervisor_Mode: "external",
+        UNRELATED_VALUE: "synthetic",
+        GITHUB_TOKEN: "synthetic-credential",
+      });
+      const readers = createSessionHistoryWorkerReaders(
+        createSessionHistoryWorkerRequestStub(async (prepare) => {
+          // postMessage uses this same clone contract before a worker can consume the request.
+          const request = structuredClone(prepare());
+          const expectedEnv = {
+            OPENCLAW_STATE_DIR: stateDir,
+            OPENCLAW_SUPERVISOR_MODE: "external",
+          };
+          switch (request.kind) {
+            case "session-exact-entries":
+              expect(request.env).toEqual(expectedEnv);
+              return { kind: request.kind, entries: [], lifecycleTimestamps: {} };
+            case "session-archive-inventory":
+              expect(request.env).toEqual(expectedEnv);
+              return { kind: request.kind, archives: [] };
+            case "session-corpus-inventory":
+              expect(request.scope.env).toEqual(expectedEnv);
+              return { kind: request.kind, entries: [] };
+            case "memory-session-targets":
+              expect(request.params.env).toEqual(expectedEnv);
+              return { kind: request.kind, targets: [] };
+            default:
+              throw new Error(`Unexpected inventory request: ${request.kind}`);
+          }
+        }),
+      );
+      const result =
+        inventory === "exact entries"
+          ? readers.readExactEntries({ env, sessionKeys: ["agent:main:main"] })
+          : inventory === "archives"
+            ? readers.readArchiveInventory({ agentId: "main", storePath, env, sessionIds: ["one"] })
+            : inventory === "targets"
+              ? readers.readMemorySessionTargets({
+                  params: { agentId: "main", storePath, env, sessionIds: ["one"] },
+                })
+              : readers.readCorpusInventory({
+                  scope: {
+                    cfg: {},
+                    normalizedAgentId: "main",
+                    storePath,
+                    env,
+                    artifactDirs: [],
+                    isSharedFixedStore: false,
+                  },
+                  options: {},
+                  artifacts: [],
+                });
+      await expect(result).resolves.toEqual(
+        inventory === "exact entries"
+          ? { kind: "session-exact-entries", entries: [], lifecycleTimestamps: {} }
+          : [],
+      );
     } finally {
-      Object.defineProperty(process, "platform", descriptor);
+      Object.defineProperty(process, "platform", { value: platform });
     }
   },
 );
 
-it("readExactEntries transports the resolved storage environment, not the caller environment", async () => {
-  const { prepared, runRequest } = captureBoundary();
-  const readers = createSessionHistoryWorkerReaders(runRequest);
-
-  await readers.readExactEntries(
-    request({
-      OPENCLAW_STATE_DIR: "synthetic-state",
-      Path: "synthetic-bin",
-      // A caller credential must not survive the storage capture.
-      GITHUB_TOKEN: "must-not-cross-the-boundary",
+it("passes the cold metadata caller's signal to its reader task", async () => {
+  const input = { sessionId: "synthetic-cold-session", env: {} };
+  const signal = new AbortController().signal;
+  const readers = createSessionHistoryWorkerReaders(
+    createSessionHistoryWorkerRequestStub(async (prepare, _inputBytes, receivedSignal) => {
+      expect(prepare()).toEqual({ kind: "cold-metadata", ...input });
+      expect(receivedSignal).toBe(signal);
+      return { kind: "cold-metadata", archive: undefined };
     }),
   );
+  await expect(readers.readColdMetadata(input, signal)).resolves.toEqual({
+    kind: "cold-metadata",
+    archive: undefined,
+  });
+});
 
-  expect(prepared).toHaveLength(1);
-  const captured = prepared[0];
-  if (captured?.kind !== "session-exact-entries") {
-    throw new Error("Expected an exact-entry request");
+it.each([
+  { view: "Uint8Array", accepted: true },
+  { view: "Uint16Array", accepted: false },
+  { view: "DataView", accepted: false },
+])("validates cross-realm $view transcript frames", async ({ view, accepted }) => {
+  const event = { type: "message", text: "hello 🦞" };
+  const json = JSON.stringify(event);
+  const bytes = Array.from(new TextEncoder().encode(json));
+  const data: unknown = runInNewContext(
+    view === "DataView" ? "new DataView(new Uint8Array(bytes).buffer)" : `new ${view}(bytes)`,
+    { bytes },
+  );
+  const version = { generation: "synthetic-generation", rawSeq: 7, updatedAt: 123 };
+  const signal = new AbortController().signal;
+  const readers = createSessionHistoryWorkerReaders(
+    createSessionHistoryWorkerRequestStub(async (_prepare, _inputBytes, _signal, onRequest) => {
+      if (!onRequest) {
+        throw new Error("Transcript reader did not provide its chunk receiver");
+      }
+      await onRequest(
+        {
+          kind: "transcript-hydration-chunk",
+          encoding: "utf-8",
+          frames: [{ data, endOfEvent: true, seq: 7 }],
+        },
+        signal,
+      );
+      return { kind: "full", version, eventCount: 1 };
+    }),
+  );
+  const result = readers.readTranscript(
+    {
+      target: { sessionId: "synthetic-session" },
+      resolvedScope: { agentId: "main", sessionId: "synthetic-session" },
+      includeEventJson: true,
+    },
+    signal,
+  );
+  if (accepted) {
+    await expect(result).resolves.toEqual({
+      kind: "full",
+      snapshot: { events: [event], eventJson: [json], eventSeqs: [7], version },
+    });
+  } else {
+    await expect(result).rejects.toThrow(
+      "Session history worker returned an invalid transcript frame",
+    );
   }
-  const env = captured.env;
-  // The reader forwards the captured storage environment, not the caller's env.
-  expect(env).toMatchObject({ OPENCLAW_STATE_DIR: expect.any(String) });
-  expect(env).not.toHaveProperty("GITHUB_TOKEN");
-  expect(() => structuredClone(env)).not.toThrow();
 });

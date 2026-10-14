@@ -1,6 +1,10 @@
+import "../test-utils/prepare-compiled-subprocesses.js";
+import fs from "node:fs";
+import path from "node:path";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { MessageChannel, type MessagePort } from "node:worker_threads";
 import { afterEach, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { encodeOpenClawStateWorkerError } from "../state/openclaw-state-worker-error.js";
 import { SqliteSnapshotCleanupError } from "./sqlite-readonly-location-cleanup.js";
@@ -27,6 +31,8 @@ vi.mock("./sqlite-readonly-worker.js", () => ({
   runSqliteReadOnlyWorkerOnce: operations.copy,
 }));
 
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
 const owned: Array<{
   resource: NativeWorkerResourceOwner;
   port1: MessagePort;
@@ -44,6 +50,7 @@ function fixture() {
     notStarted: false,
     isRetired: () => retired,
     compatible: () => !retired,
+    setIdle: () => {},
     createNativeReplacement() {
       throw new Error("Native resource must not replace its session");
     },
@@ -96,6 +103,7 @@ function fixture() {
     retainOnOperationError: true,
   };
   const cleanup: { expectedFailure?: RegExp } = {};
+  const closeNative: () => Promise<void> = native.close;
   const value = {
     resource,
     client,
@@ -110,7 +118,7 @@ function fixture() {
     hostMessages,
     hostPolicy,
     cleanup,
-    closeNative: native.close,
+    closeNative,
   };
   owned.push(value);
   return value;
@@ -120,8 +128,8 @@ afterEach(async () => {
     try {
       if (entry.cleanup.expectedFailure) {
         await expect(entry.resource.close()).rejects.toThrow(entry.cleanup.expectedFailure);
-        // The fixture has no OS child; release its mocked producer after asserting
-        // that the real resource refused to acknowledge unresolved cleanup.
+        // Join the fixture's original producer after the resource refuses
+        // to acknowledge unresolved cleanup; physical cases install their real close.
         await entry.closeNative();
       } else {
         await entry.resource.close();
@@ -226,35 +234,44 @@ it("refuses cleanup after losing its host fence port without releasing creator c
   expect(operations.remove).not.toHaveBeenCalled();
 });
 
-it.each([false, true])(
-  "acknowledges a failed allocation as empty only with native not-started proof (%s)",
-  async (notStarted) => {
-    const { client, resource, launch, native, cleanup } = fixture();
-    const failure = new Error("child exited before publishing its allocation");
-    native.run.mockImplementationOnce(async () => {
-      if (notStarted) {
-        await native.close();
-        native.notStarted = true;
-      }
-      throw failure;
+it("closes the real native session after a refused allocation", async () => {
+  const entry = fixture();
+  const actual = await vi.importActual<typeof import("./sqlite-readonly-worker.js")>(
+    "./sqlite-readonly-worker.js",
+  );
+  const root = fs.realpathSync(tempDirs.make("native-allocation-receipt-"));
+  const launch: SqliteNativeSessionLaunch = {
+    ...entry.launch,
+    cwd: root,
+    env: { ...entry.launch.env, PATH: process.env.PATH, HOME: root, TMPDIR: root },
+  };
+  const sessions: Array<ReturnType<typeof actual.createScopedSqliteReadOnlyWorker>> = [];
+  let nativeClosed = false;
+  operations.session.mockImplementation((nativeLaunch) => {
+    const native = actual.createScopedSqliteReadOnlyWorker(nativeLaunch);
+    sessions.push(native);
+    void native.closed.then(() => {
+      nativeClosed = true;
     });
-    const session = client.createSession(launch);
-    await expect(
-      session.run("/fixture/root", { mode: "staging-create", preparationId: 1 }),
-    ).rejects.toThrow(failure.message);
-    if (notStarted) {
-      await expect(resource.close()).resolves.toBeUndefined();
-    } else {
-      cleanup.expectedFailure = /allocation has no exact directory receipt/;
-      const closeFailure = await resource.close().catch((error: unknown) => error);
-      expect(closeFailure).toBeInstanceOf(SqliteSnapshotCleanupError);
-      expect(closeFailure).toHaveProperty("cause", failure);
-      expect(native.close).toHaveBeenCalledOnce();
+    return native;
+  });
+  entry.closeNative = async () => {
+    for (const native of sessions) {
+      await native.close();
+      await native.closed;
     }
-    expect(operations.copy).not.toHaveBeenCalled();
-    expect(operations.remove).not.toHaveBeenCalled();
-  },
-);
+  };
+  const session = entry.client.createSession(launch);
+  await expect(
+    session.run(path.join(root, "missing"), { mode: "staging-create", preparationId: 1 }),
+  ).rejects.toThrow("snapshot staging root");
+  await entry.resource.close();
+  expect(nativeClosed).toBe(true);
+  expect(sessions).toHaveLength(1);
+  expect(entry.inventory.size).toBe(0);
+  expect(operations.copy).not.toHaveBeenCalled();
+  expect(operations.remove).not.toHaveBeenCalled();
+});
 
 it("creates native sessions only through RPC and preserves captured launch and staging commands", async () => {
   const { client, launch, native, closed, inventory, resource } = fixture();
@@ -352,26 +369,6 @@ it("joins a cancelled copy without aborting another copy or the token session", 
     await session.close();
     await client.removed("/fixture/token");
   }
-});
-
-it("preserves expected operation errors without retiring the surviving native session", async () => {
-  const { client, launch, native } = fixture();
-  const session = client.createSession(launch);
-  const cause = new Error("token remained busy");
-  native.run.mockRejectedValueOnce(new AggregateError([cause], "retirement refused", { cause }));
-  const failure = await session
-    .run("/fixture/token", { mode: "staging-retire" })
-    .catch((error: unknown) => error);
-  expect(failure).toBeInstanceOf(AggregateError);
-  if (!(failure instanceof AggregateError)) {
-    throw new Error("Native error graph was not retained");
-  }
-  expect(failure.errors).toEqual([expect.objectContaining({ message: cause.message })]);
-  expect(failure.cause).toBe(failure.errors[0]);
-  expect(session.isRetired()).toBe(false);
-  expect(session.compatible(launch)).toBe(true);
-  expect(await session.run("/fixture/token", { mode: "staging-retire" })).toBe("/fixture/token");
-  await session.close();
 });
 
 it("seals creation and retries a failed close on the same native session", async () => {

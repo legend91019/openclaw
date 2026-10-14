@@ -1,14 +1,45 @@
-import { html, nothing } from "lit";
-import { keyed } from "lit/directives/keyed.js";
 import type { SessionObserverDigest } from "../../../packages/gateway-protocol/src/schema/sessions.js";
 import { isCriticalObserverHealth, pickFreshestObserverDigest } from "../lib/observer-digest.ts";
-import type { SidebarRecentSession } from "./app-sidebar-session-types.ts";
+import type { CatalogBackingSessionDisplay } from "./app-sidebar-session-catalogs.ts";
+import type { SidebarRecentSession, SidebarToolActivity } from "./app-sidebar-session-types.ts";
 import { sessionAttentionSubtitle } from "./session-attention-presentation.ts";
 
 type SidebarSessionSubtitle = {
   subtitle: string | undefined;
   narration: string | undefined;
+  toolName?: string;
 };
+
+export function resolveSidebarSessionRowSubtitle(
+  host: {
+    readonly sidebarAgentsMode?: "chip" | "roster";
+    readonly sessionsShowPreview: boolean;
+    readonly sidebarLiveActivity: boolean;
+    readonly sidebarTools: ReadonlyMap<string, SidebarToolActivity>;
+    readonly sessionProjection: { resolveSubtitle: typeof resolveSidebarSessionSubtitle };
+    readonly sidebarNarrationLines: ReadonlyMap<string, string>;
+    readonly sidebarObserverDigests: ReadonlyMap<string, SessionObserverDigest>;
+  },
+  session: SidebarRecentSession,
+  display?: CatalogBackingSessionDisplay,
+) {
+  const toolActivity =
+    host.sidebarAgentsMode !== "roster" &&
+    host.sessionsShowPreview &&
+    session.hasActiveRun &&
+    host.sidebarLiveActivity
+      ? host.sidebarTools.get(session.key)
+      : undefined;
+  return host.sessionProjection.resolveSubtitle({
+    session,
+    hasDisplay: display !== undefined,
+    sidebarLiveActivity: host.sidebarLiveActivity,
+    showPreview: host.sessionsShowPreview,
+    narrationLine: host.sidebarNarrationLines.get(session.key),
+    toolActivity,
+    observerDigest: host.sidebarObserverDigests.get(session.key) ?? null,
+  });
+}
 
 /** Resolves the single subtitle slot without displacing visible status. */
 export function resolveSidebarSessionSubtitle(params: {
@@ -17,6 +48,7 @@ export function resolveSidebarSessionSubtitle(params: {
   sidebarLiveActivity: boolean;
   showPreview: boolean;
   narrationLine: string | undefined;
+  toolActivity?: SidebarToolActivity;
   observerDigest?: Pick<
     SessionObserverDigest,
     "agentId" | "runId" | "headline" | "health" | "updatedAt" | "revision"
@@ -61,6 +93,17 @@ export function resolveSidebarSessionSubtitle(params: {
   // Agent-declared status (sessions tool) outranks live narration: it is an
   // explicit message to the user, not ambient activity.
   const agentStatus = session.agentStatusNote || undefined;
+  if (
+    running &&
+    params.sidebarLiveActivity &&
+    params.toolActivity?.text &&
+    !attention &&
+    !agentStatus &&
+    !isCriticalObserverHealth(projectedDigest?.health)
+  ) {
+    const { name, text } = params.toolActivity;
+    return { subtitle: text, narration: undefined, toolName: name };
+  }
   const narration =
     attention || agentStatus || observer || !params.sidebarLiveActivity || !running
       ? undefined
@@ -76,19 +119,4 @@ export function resolveSidebarSessionSubtitle(params: {
     !running && !params.hasDisplay ? session.lastMessagePreview?.trim() || undefined : undefined;
   const subtitle = attention ?? agentStatus ?? observer ?? narration ?? finalReply ?? workSubtitle;
   return { subtitle, narration };
-}
-
-export function renderSidebarSessionSubtitle(value: SidebarSessionSubtitle) {
-  if (!value.subtitle) {
-    return nothing;
-  }
-  return value.narration
-    ? keyed(
-        value.narration,
-        html`<span
-          class="sidebar-recent-session__subtitle sidebar-recent-session__subtitle--narration"
-          >${value.subtitle}</span
-        >`,
-      )
-    : html`<span class="sidebar-recent-session__subtitle">${value.subtitle}</span>`;
 }

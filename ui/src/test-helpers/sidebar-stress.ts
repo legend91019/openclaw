@@ -3,7 +3,7 @@ import { SESSION_PLACEMENT_STATES } from "../../../packages/gateway-protocol/src
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { GatewaySessionRow } from "../api/types.ts";
 import { createGatewayHarness, createSessionsHarness, mountSidebar } from "./app-sidebar.ts";
-import "../components/app-sidebar.ts";
+import "../components/app-sidebar.tsx";
 export const owner = {
   type: "human",
   id: "nora",
@@ -241,9 +241,11 @@ export async function mount(width: number) {
   const { sidebar } = mounted;
   sidebar.style.cssText = `display:block;width:${width}px;height:1000px`;
   sidebar.connected = true;
-  sidebar.hasSessionDraft = (k) => k === key("unsent-draft") || k === key("crowded");
-  sidebar.outboxAttentionCountForSession = (k) =>
-    k === key("outbox") || k === key("crowded") ? 9 : 0;
+  sidebar.storedOutboxes = {
+    total: 18,
+    attentionCountForSession: (k) => (k === key("outbox") || k === key("crowded") ? 9 : 0),
+    hasSessionDraft: (k) => k === key("unsent-draft") || k === key("crowded"),
+  };
   gateway.publishEvent("question.requested", {
     id: "stress-question",
     agentId: "main",

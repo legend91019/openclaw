@@ -1,12 +1,13 @@
 // Claw doctor diagnostics project the lifecycle ownership ledger into health findings.
-import { createHash } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
-import { coerceErrorMessage, stableStringify } from "@openclaw/normalization-core";
+
+import { coerceErrorMessage } from "@openclaw/normalization-core";
 import { listConfiguredMcpServers } from "../config/mcp-config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveDefaultCronStaggerMs } from "../cron/stagger.js";
 import type { CronJob } from "../cron/types.js";
 import type { HealthFinding } from "../flows/health-checks.js";
+import type { EngineConnection } from "../infra/sql-connection.js";
+import { tableExists } from "../state/openclaw-state-db-schema-helpers.js";
 import {
   openExistingOpenClawStateDatabaseReadOnly,
   openOpenClawStateDatabase,
@@ -14,6 +15,7 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
 import { clawCronGatewayInput } from "./cron.js";
+import { digestClawValue } from "./digest.js";
 import { isExperimentalClawsEnabled } from "./experimental.js";
 import { readClawStatus, type ClawStatusRecord } from "./lifecycle-state.js";
 
@@ -49,17 +51,13 @@ type CronInventorySnapshot =
   | { ok: false; error: string }
   | undefined;
 
-function cronExecutionDigest(value: unknown): string {
-  return `sha256:${createHash("sha256").update(stableStringify(value)).digest("hex")}`;
-}
-
 function expectedCronExecutionDigest(
   record: ClawStatusRecord,
   cron: ClawStatusRecord["cronJobs"][number],
 ): string {
   const input = clawCronGatewayInput(record.install.agentId, cron);
   const staggerMs = resolveDefaultCronStaggerMs(cron.job.schedule.cron);
-  return cronExecutionDigest({
+  return digestClawValue({
     declarationKey: input.declarationKey,
     ownerAgentId: input.owner.agentId,
     enabled: input.enabled,
@@ -75,7 +73,7 @@ function expectedCronExecutionDigest(
 }
 
 function liveCronExecutionDigest(job: CronJob): string {
-  return cronExecutionDigest({
+  return digestClawValue({
     declarationKey: job.declarationKey,
     ownerAgentId: job.owner?.agentId ?? job.agentId,
     enabled: job.enabled,
@@ -111,7 +109,7 @@ function collectInstallFindings(
           record.agentState === "missing"
             ? `Claw-owned agent ${JSON.stringify(agentId)} is missing from config.`
             : `Claw-owned agent ${JSON.stringify(agentId)} changed after installation.`,
-        path: `agents.list.${agentId}`,
+        path: `agents.entries.${agentId}`,
         target: agentId,
         requirement: "Claw-owned agent config should match its recorded install digest",
         fixHint: "Inspect the agent change before removing or replacing Claw-owned state.",
@@ -144,7 +142,7 @@ function collectInstallFindings(
           message: `Claw extension ${JSON.stringify(pkg.extension?.id ?? pkg.ref)} has ${pkg.extensionCompatibility.state} host compatibility state${pkg.extensionCompatibility.message ? `: ${pkg.extensionCompatibility.message}` : "."}`,
           path: `claws.${agentId}.extensions.${pkg.extension?.id ?? pkg.ref}`,
           target: `${pkg.source}:${pkg.ref}@${pkg.version}`,
-          requirement: "Claw extensions should retain their consented canonical capability mapping",
+          requirement: "Claw extensions should retain their approved capability mapping",
           fixHint: "Preview a Claw update before accepting the host's current extension mapping.",
         }),
       );
@@ -157,7 +155,7 @@ function collectInstallFindings(
         message: `Claw ${pkg.kind} ${JSON.stringify(`${pkg.ref}@${pkg.version}`)} has ${pkg.state} lifecycle state.`,
         path: `claws.${agentId}.packages.${pkg.kind}.${pkg.ref}`,
         target: `${pkg.source}:${pkg.ref}@${pkg.version}`,
-        requirement: "Claw package references should match canonical installed package state",
+        requirement: "Claw package references should match current installed package state",
         fixHint:
           "Inspect package state with `openclaw claws status` before updating or removing the Claw.",
       }),
@@ -172,7 +170,7 @@ function collectInstallFindings(
         message: `Claw MCP server ${JSON.stringify(server.name)} has ${server.state} ownership state${server.error ? `: ${server.error}` : "."}`,
         path: `mcp.servers.${server.name}`,
         target: server.name,
-        requirement: "Claw MCP ownership should be complete and match live canonical config",
+        requirement: "Claw MCP ownership should be complete and match current live config",
         fixHint:
           server.state === "failed"
             ? "Remove the partial Claw to release its non-owning reference."
@@ -248,14 +246,6 @@ function collectInstallFindings(
   return findings;
 }
 
-function tableExists(db: DatabaseSync, name: string): boolean {
-  return Boolean(
-    db /* sqlite-allow-raw: read-only Claw doctor table-existence probe with bound table name. */
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-      .get(name),
-  );
-}
-
 function orphanedAgentIds(options: OpenClawStateDatabaseOptions): string[] {
   const { db } = openOpenClawStateDatabase(options);
   const installed = new Set<string>();
@@ -289,7 +279,7 @@ function orphanedAgentIds(options: OpenClawStateDatabaseOptions): string[] {
   return [...referenced].filter((agentId) => !installed.has(agentId)).toSorted();
 }
 
-function hasClawMcpServerRefs(db: DatabaseSync): boolean {
+function hasClawMcpServerRefs(db: EngineConnection): boolean {
   return (
     tableExists(db, "claw_mcp_server_refs") &&
     Boolean(
@@ -318,14 +308,14 @@ export async function collectClawStateHealthFindings(
   }
   let database: OpenClawStateDatabase | undefined;
   try {
-    database = await openExistingOpenClawStateDatabaseReadOnly(options);
+    database = await openExistingOpenClawStateDatabaseReadOnly({
+      ...options,
+      requireCanonicalSchema: true,
+    });
     if (!database) {
       return [];
     }
     const orphanedRefs = orphanedAgentIds({ ...options, database, readOnly: true });
-    if (!tableExists(database.db, "claw_installs")) {
-      return orphanedRefs.map(orphanedReferenceFinding);
-    }
     let sourceMcpServers = options.sourceMcpServers ?? {};
     if (hasClawMcpServerRefs(database.db) && !options.sourceMcpServers) {
       const listed = await (options.listMcpServers ?? listConfiguredMcpServers)();

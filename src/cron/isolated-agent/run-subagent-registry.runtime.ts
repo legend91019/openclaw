@@ -28,6 +28,7 @@ function withCronDescendantRuns<T>(
       };
     },
     (_selection, runs) => consume(new Map(runs)),
+    { sessionKeys: [sessionKey], descendants: true },
   );
 }
 
@@ -58,8 +59,6 @@ export function hasUnsettledCronDescendants(sessionKey: string): Promise<boolean
 export async function prepareCronDescendantDeletion(sessionKeys: readonly string[]) {
   const prepared = await prepareSubagentRunsSnapshotForSessions(subagentRuns, sessionKeys);
   return {
-    basis: prepared.basis,
-    dispose: () => prepared.dispose(),
     hasUnsettled(sessionKey: string) {
       const current = prepared.consume((runs) =>
         hasDescendantRunAwaitingSettleFromRuns(new Map(runs), sessionKey),

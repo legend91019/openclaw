@@ -35,7 +35,6 @@ export function assertNodePreparedWorkspacePaths(
     if (
       target !== expected ||
       !stats.isDirectory() ||
-      stats.isSymbolicLink() ||
       fs.realpathSync.native(target) !== expected
     ) {
       throw new Error("INVALID_REQUEST: prepared workspace path escaped its owner root");
@@ -80,6 +79,8 @@ export function resolveNodePreparedWorkspaceIdentity(
 }
 
 export type NodeWorkerManagedWorkspaceRequest = {
+  /** Required for device folders; managed paths already carry their gateway namespace. */
+  gatewayNamespace?: string;
   workspaceDir: string;
   environmentId: string;
   sessionId: string;
@@ -200,7 +201,6 @@ export function resolveNodeManagedWorkspaceIdentity(
     String(request.ownerEpoch),
   );
   if (
-    stats.isSymbolicLink() ||
     !stats.isDirectory() ||
     !isPathInside(root, workspaceDir) ||
     components.length !== 5 ||
@@ -222,12 +222,30 @@ export function resolveNodeManagedWorkspaceIdentity(
   };
 }
 
+export function ensureNodeWorkerWorkspaceSessionRoot(
+  root: string,
+  gatewayNamespace: string,
+  environmentId: string,
+  sessionId: string,
+) {
+  if (!GATEWAY_NAMESPACE_PATTERN.test(gatewayNamespace)) {
+    throw new Error("INVALID_REQUEST: invalid node workspace gateway namespace");
+  }
+  const gatewayRoot = ensureContainedDirectory(root, gatewayNamespace);
+  const workspacesRoot = ensureContainedDirectory(gatewayRoot, "workspaces");
+  const environmentRoot = ensureContainedDirectory(
+    workspacesRoot,
+    hashNodeWorkerWorkspaceComponent(environmentId, 16),
+  );
+  return ensureContainedDirectory(environmentRoot, hashNodeWorkerWorkspaceComponent(sessionId, 32));
+}
+
 export function ensureContainedDirectory(parent: string, name: string): string {
   const candidate = path.join(parent, name);
   fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
   const stats = fs.lstatSync(candidate);
   const resolved = fs.realpathSync.native(candidate);
-  if (stats.isSymbolicLink() || !stats.isDirectory() || !isPathInside(parent, resolved)) {
+  if (!stats.isDirectory() || !isPathInside(parent, resolved)) {
     throw new Error("INVALID_REQUEST: node worker workspace path escaped its owner root");
   }
   tightenPrivateDirRootSync(resolved, 0o700);
@@ -285,7 +303,6 @@ export async function removeNodeWorkerWorkspaceEntry(
       fs.promises.realpath(target),
     ]);
     if (
-      stats.isSymbolicLink() ||
       !(kind === "directory" ? stats.isDirectory() : stats.isFile()) ||
       path.dirname(resolved) !== parent ||
       !isPathInside(root, resolved)
@@ -306,17 +323,11 @@ export async function removeNodeWorkerWorkspaceEntry(
   }
 }
 
-export type NodeWorkerWorkspaceRetainSnapshot = {
-  controllerId: string;
-  sequence: number;
-  signature: string;
-  retainedGenerations: Set<string>;
-  manifestsBySession: Map<string, Set<string> | null>;
-};
+export type NodeWorkerWorkspaceRetainSnapshot = ReturnType<
+  typeof buildNodeWorkerWorkspaceRetainSnapshot
+>;
 
-export function buildNodeWorkerWorkspaceRetainSnapshot(
-  input: NodeWorkerWorkspaceRetainInput,
-): NodeWorkerWorkspaceRetainSnapshot {
+export function buildNodeWorkerWorkspaceRetainSnapshot(input: NodeWorkerWorkspaceRetainInput) {
   const retainedGenerations = new Set<string>();
   const manifestsBySession = new Map<string, Set<string> | null>();
   for (const entry of input.retain) {
@@ -350,3 +361,10 @@ export function buildNodeWorkerWorkspaceRetainSnapshot(
     manifestsBySession,
   };
 }
+
+export type NodeWorkerWorkspaceAcquisition = {
+  workspaceDir: string;
+  homeDir?: string;
+  assertCurrent?: () => void;
+  release: () => void;
+};

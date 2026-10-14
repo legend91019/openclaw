@@ -1,13 +1,19 @@
-import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import type { OpenClawStateDatabase } from "../../state/openclaw-state-db-contract.js";
 import { resolveCronJobConfigRevision } from "../config-revision.js";
 import type { CronJobState, CronStoredJob, CronStoreFile } from "../types.js";
-import { deleteCronQuarantinedJobsFromDatabase, saveCronQuarantinedJobs } from "./quarantine.js";
+import { hasCanonicalCronDeliveryMode } from "./delivery-codec.js";
+import {
+  deleteCronQuarantinedJobsFromDatabase,
+  prepareCronQuarantineRegistration,
+  registerCronQuarantineInDatabase,
+} from "./quarantine.kernel.js";
 import {
   deleteCronJobRowInDatabase,
   loadedCronStoreFromRows,
   loadCronRows,
+  projectCronJobThroughStorageCodec,
   replaceCronRows,
   upsertCronJobRow,
   updateCronRuntimeRows,
@@ -86,9 +92,32 @@ export function prepareCronStoreChanges(
   return { previousById, nextById, changedIds };
 }
 
+/** Both save modes fence only the definitions this mutation intends to change. */
+function assertCronStoreChangesCurrent(
+  prepared: PreparedCronStoreChanges,
+  currentById: ReadonlyMap<string, CronStoredJob>,
+  resolvedStorePath: string,
+  opts?: CronStoreChangesOptions,
+): void {
+  for (const jobId of prepared.changedIds) {
+    const before = prepared.previousById.get(jobId);
+    const after = prepared.nextById.get(jobId);
+    const current = currentById.get(jobId);
+    if (
+      (before &&
+        current &&
+        resolveCronJobConfigRevision(current) !== resolveCronJobConfigRevision(before)) ||
+      (after && before && !current) ||
+      (after && !before && current && !opts?.preserveConcurrentAdds)
+    ) {
+      throw new CronJobsStoreChangedError(resolvedStorePath);
+    }
+  }
+}
+
 /** Applies prepared changes inside the caller's synchronous write transaction. */
 export function saveCronStoreChangesInDatabase(
-  db: DatabaseSync,
+  db: EngineConnection,
   storeKey: string,
   resolvedStorePath: string,
   prepared: PreparedCronStoreChanges,
@@ -110,18 +139,12 @@ export function saveCronStoreChangesInDatabase(
   }
   const currentById = new Map(currentJobs.map((job) => [job.id, job] as const));
   hooks?.hooks.beforeWrite?.(db, hooks.receiptSchema);
+  assertCronStoreChangesCurrent(prepared, currentById, resolvedStorePath, opts);
   let nextSortOrder = rows.reduce((max, row) => Math.max(max, row.sort_order), -1) + 1;
   for (const jobId of changedIds) {
     const before = previousById.get(jobId);
     const after = nextById.get(jobId);
     const current = currentById.get(jobId);
-    if (
-      before &&
-      current &&
-      resolveCronJobConfigRevision(current) !== resolveCronJobConfigRevision(before)
-    ) {
-      throw new CronJobsStoreChangedError(resolvedStorePath);
-    }
     if (!after) {
       if (current) {
         deleteCronJobRowInDatabase(db, storeKey, jobId);
@@ -129,14 +152,8 @@ export function saveCronStoreChangesInDatabase(
       currentById.delete(jobId);
       continue;
     }
-    if (before) {
-      if (!current) {
-        throw new CronJobsStoreChangedError(resolvedStorePath);
-      }
-    } else if (current && opts?.preserveConcurrentAdds) {
+    if (!before && current && opts?.preserveConcurrentAdds) {
       continue;
-    } else if (current) {
-      throw new CronJobsStoreChangedError(resolvedStorePath);
     }
     const merged: CronStoredJob = current
       ? {
@@ -151,15 +168,23 @@ export function saveCronStoreChangesInDatabase(
       merged,
       rowsById.get(jobId)?.sort_order ?? nextSortOrder++,
     );
-    replaceCronRuntimeAuthorityRows({ db, storeKey, jobs: [persisted] });
-    currentById.set(jobId, persisted);
+    if (hasCanonicalCronDeliveryMode(persisted.delivery)) {
+      replaceCronRuntimeAuthorityRows({ db, storeKey, jobs: [persisted] });
+      const postimage = projectCronJobThroughStorageCodec(persisted);
+      if (persisted.runtimeAuthorityRecoveryRequired === true) {
+        postimage.runtimeAuthorityRecoveryRequired = true;
+      } else if (persisted.runtimeAuthority) {
+        postimage.runtimeAuthority = persisted.runtimeAuthority;
+      }
+      currentById.set(jobId, postimage);
+    }
   }
   hooks?.hooks.afterWrite?.(db, hooks.receiptSchema);
   return { version: 1, jobs: [...currentById.values()] } satisfies CronStoreFile;
 }
 
 function replaceCronStoreRowsInDatabase(
-  db: DatabaseSync,
+  db: EngineConnection,
   storeKey: string,
   store: CronStoreFile,
   preserveRuntimeState: boolean,
@@ -168,7 +193,7 @@ function replaceCronStoreRowsInDatabase(
   replaceCronRuntimeAuthorityRows({
     db,
     storeKey,
-    jobs: replaced.jobs,
+    jobs: replaced.jobs.filter((job) => hasCanonicalCronDeliveryMode(job.delivery)),
     preserveExistingForJobIds: preserveRuntimeState ? replaced.existingJobIds : undefined,
     writeMissingForJobIds: preserveRuntimeState ? replaced.legacyAuthorityJobIds : undefined,
   });
@@ -193,12 +218,10 @@ export function saveCronStoreInDatabase(
   const stateOnly = isCronRuntimeOnlySave(opts);
   hooks?.hooks.beforeWrite?.(database.db, hooks.receiptSchema);
   if (opts?.quarantine?.entries.length) {
-    saveCronQuarantinedJobs({
-      storePath: storeKey,
-      entries: opts.quarantine.entries,
-      nowMs: opts.quarantine.nowMs,
-      database,
-    });
+    registerCronQuarantineInDatabase(
+      database.db,
+      prepareCronQuarantineRegistration({ storePath: storeKey, ...opts.quarantine }),
+    );
   }
   if (opts?.deleteQuarantineEntries?.length) {
     deleteCronQuarantinedJobsFromDatabase({
