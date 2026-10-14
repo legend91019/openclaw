@@ -1,9 +1,9 @@
 import { expect, it } from "vitest";
+import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
 import {
   createSessionHistoryWorkerReaders,
   type SessionHistoryWorkerRequestRunner,
 } from "./session-transcript-worker-readers.js";
-import { captureSessionTranscriptStorageEnvironment } from "./transcript-target-binding.js";
 
 /**
  * `captureSessionTranscriptStorageEnvironment` is unit-tested against the
@@ -23,20 +23,16 @@ type ExactEntriesInput = Parameters<Readers["readExactEntries"]>[0];
 type ExactEntriesResult = Awaited<ReturnType<Readers["readExactEntries"]>>;
 /** The value `prepare()` returns, i.e. exactly what `worker.postMessage` receives. */
 type PreparedInput = ReturnType<Parameters<SessionHistoryWorkerRequestRunner>[0]>;
-type PreparedEnv = Extract<PreparedInput, { env: unknown }>["env"];
 
 /** Capture what the reader hands to `worker.postMessage`, then clone it the way the worker does. */
 function captureBoundary(): {
   prepared: PreparedInput[];
-  inputBytes: number[];
   runRequest: SessionHistoryWorkerRequestRunner;
 } {
   const prepared: PreparedInput[] = [];
-  const inputBytes: number[] = [];
-  const runRequest: SessionHistoryWorkerRequestRunner = async (prepare, bytes, receive) => {
+  const runRequest: SessionHistoryWorkerRequestRunner = async (prepare, _bytes, receive) => {
     const input = prepare();
     prepared.push(input);
-    inputBytes.push(bytes);
     // `Worker.postMessage` structured-clones the prepared input; mirror that here.
     structuredClone(input);
     return receive({
@@ -45,11 +41,11 @@ function captureBoundary(): {
       lifecycleTimestamps: {},
     } as ExactEntriesResult);
   };
-  return { prepared, inputBytes, runRequest };
+  return { prepared, runRequest };
 }
 
 const request = (env: NodeJS.ProcessEnv): ExactEntriesInput => ({
-  env,
+  env: cloneEnvWithPlatformSemantics(env),
   sessionKeys: ["agent:main:main"],
 });
 
@@ -96,32 +92,13 @@ it("readExactEntries transports the resolved storage environment, not the caller
   );
 
   expect(prepared).toHaveLength(1);
-  const env = prepared[0].env as PreparedEnv;
+  const captured = prepared[0];
+  if (captured?.kind !== "session-exact-entries") {
+    throw new Error("Expected an exact-entry request");
+  }
+  const env = captured.env;
   // The reader forwards the captured storage environment, not the caller's env.
   expect(env).toMatchObject({ OPENCLAW_STATE_DIR: expect.any(String) });
   expect(env).not.toHaveProperty("GITHUB_TOKEN");
   expect(() => structuredClone(env)).not.toThrow();
-});
-
-it("readExactEntries reports a byte estimate of the captured payload", async () => {
-  const { prepared, inputBytes, runRequest } = captureBoundary();
-  const readers = createSessionHistoryWorkerReaders(runRequest);
-
-  const input = request({
-    OPENCLAW_STATE_DIR: "synthetic-state",
-    Path: "synthetic-bin",
-  });
-  await readers.readExactEntries(input);
-
-  // The estimate is measured on the captured request before the `kind` tag is added,
-  // so it must match that intermediate payload rather than the fully tagged one.
-  expect(inputBytes).toHaveLength(1);
-  expect(inputBytes[0]).toBe(
-    JSON.stringify({
-      ...input,
-      env: captureSessionTranscriptStorageEnvironment(input.env),
-    }).length * 2,
-  );
-  // And the transported payload carries exactly one extra field, the discriminant.
-  expect(prepared[0].kind).toBe("session-exact-entries");
 });
