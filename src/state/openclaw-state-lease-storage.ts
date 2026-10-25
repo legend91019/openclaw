@@ -25,6 +25,7 @@ import {
   LEASE_CONTENTION_RETRY_TIMEOUT_MS,
 } from "./openclaw-state-lease-heartbeat-shared.js";
 import {
+  readOpenClawStateLease,
   readOpenClawStateLeaseExpiry,
   releaseOpenClawStateLeaseInTransaction,
   renewOpenClawStateLeaseInTransaction,
@@ -111,20 +112,57 @@ export const STATE_LEASE_WRITE_BACKOFF = {
 
 export type OpenClawStateLeaseOwnerIdentity = OpenClawStateLeaseIdentity & { leaseLabel: string };
 
+export function describeOpenClawStateLeaseLossReason(
+  row: { owner: string; expiresAt: number; heartbeatAt?: number | null } | null | undefined,
+  identity: Pick<OpenClawStateLeaseIdentity, "owner">,
+  nowMs?: number,
+): string | undefined {
+  if (!row) {
+    return "lease record is missing";
+  }
+  if (row.owner !== identity.owner) {
+    return "lease owner was replaced";
+  }
+  const now = nowMs ?? Date.now();
+  if (row.expiresAt <= now) {
+    const expiredAgo = Math.max(0, now - row.expiresAt);
+    if (row.heartbeatAt != null) {
+      const heartbeatAgo = Math.max(0, now - row.heartbeatAt);
+      return `lease expired ${expiredAgo} ms ago; last heartbeat ${heartbeatAgo} ms ago`;
+    }
+    return `lease expired ${expiredAgo} ms ago`;
+  }
+  return undefined;
+}
+
 export function renewOpenClawStateLease(
   params: OpenClawStateLeaseOwnerIdentity & {
     database: OpenClawStateLeaseDatabase;
     operationLabel: string;
     leaseMs: number;
+    nowMs?: number;
   },
 ): number {
   return withLeaseWriteTransaction(
     params.database,
     params.operationLabel === "state.lease" ? "state.lease.renew" : params.operationLabel,
     (db) => {
-      const expiresAt = renewOpenClawStateLeaseInTransaction(db, params, params.leaseMs);
+      const expiresAt = renewOpenClawStateLeaseInTransaction(
+        db,
+        params,
+        params.leaseMs,
+        undefined,
+        params.nowMs,
+      );
       if (expiresAt === undefined) {
-        throw createOpenClawStateLeaseLostError(params);
+        let reason: string | undefined;
+        try {
+          const row = readOpenClawStateLease(db, params);
+          reason = describeOpenClawStateLeaseLossReason(row, params, params.nowMs);
+        } catch {
+          // Preserve generic loss error if row inspection fails.
+        }
+        throw createOpenClawStateLeaseLostError(params, reason);
       }
       return expiresAt;
     },
@@ -134,10 +172,18 @@ export function renewOpenClawStateLease(
 function assertOpenClawStateLeaseOwnedInDatabase(
   database: EngineConnection,
   params: OpenClawStateLeaseOwnerIdentity,
+  nowMs?: number,
 ): number {
-  const expiresAt = readOpenClawStateLeaseExpiry(database, params);
+  const expiresAt = readOpenClawStateLeaseExpiry(database, params, nowMs);
   if (expiresAt === undefined) {
-    throw createOpenClawStateLeaseLostError(params);
+    let reason: string | undefined;
+    try {
+      const row = readOpenClawStateLease(database, params);
+      reason = describeOpenClawStateLeaseLossReason(row, params, nowMs);
+    } catch {
+      // Preserve generic loss error if row inspection fails.
+    }
+    throw createOpenClawStateLeaseLostError(params, reason);
   }
   return expiresAt;
 }
@@ -146,18 +192,19 @@ export function verifyOpenClawStateLeaseOwnership(
   params: OpenClawStateLeaseOwnerIdentity & {
     database?: OpenClawStateLeaseDatabase;
     transaction?: EngineConnection;
+    nowMs?: number;
   },
 ): number {
   try {
     if (params.transaction) {
-      return assertOpenClawStateLeaseOwnedInDatabase(params.transaction, params);
+      return assertOpenClawStateLeaseOwnedInDatabase(params.transaction, params, params.nowMs);
     }
     const database = params.database;
     if (!database) {
       throw new Error("state lease ownership check requires a database");
     }
     const read = () =>
-      readLeaseDatabase(database, (db) => assertOpenClawStateLeaseOwnedInDatabase(db, params));
+      readLeaseDatabase(database, (db) => assertOpenClawStateLeaseOwnedInDatabase(db, params, params.nowMs));
     const maintenance = getOpenClawDatabaseMaintenanceScope();
     if (isStatePostgres() && maintenance?.ownsSchemaMaintenance) {
       // Doctor's synchronous lease check remains inside its admitted maintenance lifetime.

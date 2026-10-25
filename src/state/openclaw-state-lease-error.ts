@@ -67,12 +67,16 @@ export function createOpenClawStateLeaseError(
 
 export function createOpenClawStateLeaseLostError(
   identity: { scope: string; key: string; leaseLabel?: string },
+  reasonOrCause?: string | unknown,
   cause?: unknown,
 ): OpenClawStateLeaseError {
+  const hasReason = typeof reasonOrCause === "string" && reasonOrCause.length > 0;
+  const reasonSuffix = hasReason ? ` (${reasonOrCause})` : "";
+  const actualCause = hasReason ? cause : reasonOrCause;
   return createOpenClawStateLeaseError(
     "OPENCLAW_STATE_LEASE_LOST",
-    `${identity.leaseLabel ?? "state lease"} ${identity.scope}/${identity.key} was lost`,
-    cause,
+    `${identity.leaseLabel ?? "state lease"} ${identity.scope}/${identity.key} was lost${reasonSuffix}`,
+    actualCause,
   );
 }
 
